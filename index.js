@@ -28,6 +28,9 @@ function getObject(data) {
   return data;
 }
 
+// fastify uses the built-in AJV instance during serialization, and that
+// instance does not know about int32 and int64 so remove those formats
+// from the responses
 const unknownFormats = { int32: true, int64: true };
 
 function stripResponseFormats(schema) {
@@ -114,15 +117,17 @@ async function fastifyOpenapiGlue(instance, opts) {
 
     config.routes.forEach((item) => {
       const { response } = item.schema;
+      const controllerName = item.operationId;
+      const url = item.url.split('/');
+      const className = url[1];
+      const methodName = url[2];
+      const lowerClassName = className.toLowerCase();
 
       if (response) {
         stripResponseFormats(response);
       }
-      if (service[item.operationId]) {
-        const controllerName = item.operationId;
-        const url = item.url.split('/');
-        const className = url[1];
-        const methodName = url[2];
+
+      if (service[controllerName]) {
 
         routesInstance.log.debug('service has', controllerName);
 
@@ -130,6 +135,29 @@ async function fastifyOpenapiGlue(instance, opts) {
           if (opts.metrics && opts.metrics[`${controllerName}${opts.metrics.suffix.total}`]) {
             opts.metrics[`${controllerName}${opts.metrics.suffix.total}`].mark();
           }
+
+          request.controllerName = controllerName;
+
+          try {
+            if (global.CHECK_TOKEN) await checkAccess(request, item);
+          } catch (error) {
+            if (error.message.split(' ').includes('expired')) {
+              reply.code(440).send({ Status: 440, Description: `${error.message}` });
+            } else {
+              reply.code(401).send({ Status: 401, Description: `${error.message}` });
+            }
+          }
+        };
+
+        item.handler = async (request, reply) => service[controllerName](request, reply);
+
+      }
+      else if (service[lowerClassName][className + methodName]) {
+
+        routesInstance.log.debug('service has', className + methodName);
+
+        item.preValidation = async (request, reply) => {
+
           if (opts.metrics && opts.metrics[`${className}${methodName}${opts.metrics.suffix.total}`]) {
             opts.metrics[`${className}${methodName}${opts.metrics.suffix.total}`].mark();
           }
@@ -147,11 +175,10 @@ async function fastifyOpenapiGlue(instance, opts) {
           }
         };
 
-        item.handler = async (request, reply) => service[className + methodName](request, reply);
+        item.handler = async (request, reply) => service[lowerClassName][className + methodName](request, reply);
 
-        item.handler = async (request, reply) => service[controllerName](request, reply);
-
-      } else {
+      }
+      else {
         item.handler = async () => {
           throw new Error(`Operation ${item.operationId} not implemented`);
         };
