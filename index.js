@@ -1,31 +1,33 @@
-const fp = require("fastify-plugin");
+const fp = require('fastify-plugin');
 const ip = require('ip');
 const jwt = require('jsonwebtoken');
-const parser = require("./lib/parser");
+const Ajv = require('ajv-oai');
+const parser = require('./lib/parser');
+
+const ajv = new Ajv({
+  removeAdditional: true,
+  useDefaults: true,
+  coerceTypes: true,
+});
 
 function isObject(obj) {
-  return typeof obj === "object" && obj !== null;
+  return typeof obj === 'object' && obj !== null;
 }
 
-function getObject(param) {
-  let data = param;
-  if (typeof param === "string") {
+function getObject(data) {
+  if (typeof data === 'string') {
     try {
-      data = require(param);
+      data = require(data);
     } catch (error) {
-      throw new Error(`failed to load ${param}`);
+      throw new Error(`failed to load ${data}`);
     }
-  }
-  if (typeof data === "function") {
+  } else if (typeof data === 'function') {
     data = data();
   }
 
   return data;
 }
 
-// fastify uses the built-in AJV instance during serialization, and that
-// instance does not know about int32 and int64 so remove those formats
-// from the responses
 const unknownFormats = { int32: true, int64: true };
 
 function stripResponseFormats(schema) {
@@ -41,21 +43,12 @@ function stripResponseFormats(schema) {
 
 async function fastifyOpenapiGlue(instance, opts) {
   const service = getObject(opts.service);
-  if (!isObject(service)) {
-    throw new Error("'service' parameter must refer to an object");
-  }
-
   const config = await parser().parse(opts.specification);
   const routeConf = {};
 
-  // AJV misses some validators for int32, int64 etc which ajv-oai adds
-  const Ajv = require("ajv-oai");
-  const ajv = new Ajv({
-    // the fastify defaults
-    removeAdditional: true,
-    useDefaults: true,
-    coerceTypes: true
-  });
+  if (!isObject(service)) {
+    throw new Error("'service' parameter must refer to an object");
+  }
 
   instance.setValidatorCompiler(schema => ajv.compile(schema));
 
@@ -69,87 +62,97 @@ async function fastifyOpenapiGlue(instance, opts) {
    * @return {Promise.<void>}
    */
   async function checkJWT(request, entity) {
+    const token = request.headers.authorization.split(' ')[1];
+
     if (!('authorization' in request.headers)) {
       const message = `Missing authorization header for ${entity}`;
       await global.mq.openapiFailures(request, null, message);
       throw new Error(message);
     }
-    const token = request.headers['authorization'].split(' ')[1];
-    let payload;
 
-    // check if the token is expired or broken
     try {
-      payload = jwt.verify(token, global.PUBLIC_KEY, { algorithm: "RS256" });
-    } catch (err) {
-      const message = `${err.name} ${err.message} for ${entity}`;
-      await global.mq.openapiFailures(request, null, message);
-      throw new Error(message);
-    }
+      const payload = jwt.verify(token, opts.publicKey, { algorithms: ['RS256'] });
 
-    const { IpList, Role } = payload;
+      const { IpList, Role } = payload;
 
-    // check that client IP in token range
-    if (IpList && IpList.length) {
-      const ipInAllowedRange = IpList.some(ipRange => ip.cidrSubnet(ipRange).contains(request.req.ip));
-      if (!ipInAllowedRange) {
-        const message = 'IP address if out of range you permit for';
-        await global.mq.openapiFailures(request, payload, message);
-        throw new Error(message);
+      // check that client IP in token range
+      if (IpList && IpList.length) {
+        const ipInAllowedRange = IpList.some((ipRange) => ip.cidrSubnet(ipRange).contains(request.req.ip));
+
+        if (!ipInAllowedRange) {
+          const message = 'IP address if out of range you permit for';
+
+          throw new Error(message);
+        }
       }
-    }
 
-    request.Roles = Role;
-    request.EntityId = payload.EntityId || 'not provided';
-    request.EntityType = payload.EntityType || 'not provided';
+      request.Roles = Role;
+      request.EntityId = payload.EntityId || 'not provided';
+      request.EntityType = payload.EntityType || 'not provided';
+    } catch (error) {
+      const message = `${error.name} ${error.message} for ${entity}`;
 
-    // send requet message to the AMQP if everything's fine
-    if (global.mq) {
-      global.mq.openapiRequests(request, payload);
+      throw new Error(message);
     }
   }
 
   async function checkAccess(request, item) {
     if (item.schema) {
-      const schema = item.schema;
+      const { schema } = item;
       // TODO extend rule for more x-auth-type
       const xAuthTypes = item.openapiSource['x-AuthType'];
-      if (xAuthTypes.length && !xAuthTypes.some(el => el === "None")) {
+      const even = (element) => element === 'None';
+
+      if (xAuthTypes.length && !xAuthTypes.some(even)) {
         request.xAuthTypes = xAuthTypes;
         await checkJWT(request, schema.operationId);
       }
     }
   }
 
-  async function generateRoutes(routesInstance, opt) {
-    config.routes.forEach(item => {
-      const response = item.schema.response;
+  async function generateRoutes(routesInstance) {
+
+    config.routes.forEach((item) => {
+      const { response } = item.schema;
+
       if (response) {
         stripResponseFormats(response);
       }
       if (service[item.operationId]) {
         const controllerName = item.operationId;
-        routesInstance.log.debug("service has", controllerName);
-        item.preValidation = async (request, reply, done) => {
+        const url = item.url.split('/');
+        const className = url[1];
+        const methodName = url[2];
+
+        routesInstance.log.debug('service has', controllerName);
+
+        item.preValidation = async (request, reply) => {
           if (opts.metrics && opts.metrics[`${controllerName}${opts.metrics.suffix.total}`]) {
             opts.metrics[`${controllerName}${opts.metrics.suffix.total}`].mark();
           }
-          request.controllerName = controllerName;
+          if (opts.metrics && opts.metrics[`${className}${methodName}${opts.metrics.suffix.total}`]) {
+            opts.metrics[`${className}${methodName}${opts.metrics.suffix.total}`].mark();
+          }
+
+          request.controllerName = `${className}/${methodName}`;
+
           try {
             if (global.CHECK_TOKEN) await checkAccess(request, item);
           } catch (error) {
             if (error.message.split(' ').includes('expired')) {
-              reply.code(440).send({ 'Status': 440, 'Description': `${error.message}` });
-            }
-            else {
-              reply.code(401).send({ 'Status': 401, 'Description': `${error.message}` });
+              reply.code(440).send({ Status: 440, Description: `${error.message}` });
+            } else {
+              reply.code(401).send({ Status: 401, Description: `${error.message}` });
             }
           }
         };
-        item.handler = async (request, reply) => {
-          return service[item.operationId](request, reply);
-        };
+
+        item.handler = async (request, reply) => service[className + methodName](request, reply);
+
+        item.handler = async (request, reply) => service[controllerName](request, reply);
+
       } else {
-        item.handler = async (request, reply) => {
+        item.handler = async () => {
           throw new Error(`Operation ${item.operationId} not implemented`);
         };
       }
@@ -161,11 +164,6 @@ async function fastifyOpenapiGlue(instance, opts) {
 }
 
 module.exports = fp(fastifyOpenapiGlue, {
-  fastify: ">=0.39.0",
-  name: "fastify-openapi-glue"
+  fastify: '>=0.39.0',
+  name: 'fastify-openapi-glue',
 });
-
-module.exports.options = {
-  specification: "examples/petstore/petstore-swagger.v2.json",
-  service: "examples/petstore/service.js"
-};
