@@ -101,7 +101,7 @@ async function fastifyOpenapiGlue(instance, opts) {
 
   async function checkAccess(request, item) {
     if (item.schema) {
-      const { schema } = item;
+      const schema = item.schema;
       // TODO extend rule for more x-auth-type
       const xAuthTypes = item.openapiSource['x-AuthType'];
       const even = (element) => element === 'None';
@@ -116,30 +116,41 @@ async function fastifyOpenapiGlue(instance, opts) {
   async function generateRoutes(routesInstance) {
 
     config.routes.forEach((item) => {
-      const { response } = item.schema;
-      const controllerName = item.operationId;
-      const url = item.url.split('/');
-      const className = url[1];
-      const methodName = url[2];
-      const lowerClassName = className.toLowerCase();
+      try {
+        const response = item.schema.response;
+        const controllerName = item.operationId;
+        const url = item.url.split('/');
+        const className = url[1];
+        const methodName = url[2];
+        const lowerClassName = className.toLowerCase();
 
-      if (response) {
-        stripResponseFormats(response);
-      }
+        if (response) {
+          stripResponseFormats(response);
+        }
+        let ServiceRouteName;
+        if (service[controllerName]) {
+          ServiceRouteName = controllerName;
 
-      if (service[controllerName]) {
+          item.handler = async (request, reply) => service[ServiceRouteName](request, reply);
+        } else if (service[lowerClassName] && service[lowerClassName][className + methodName]) {
+          ServiceRouteName = className + methodName;
 
-        routesInstance.log.debug('service has', controllerName);
+          item.handler = async (request, reply) => service[lowerClassName][ServiceRouteName](request, reply);
+        } else {
+          throw new Error('Service not exists');
+        }
+
+        routesInstance.log.debug('service has', ServiceRouteName);
 
         item.preValidation = async (request, reply) => {
-          if (opts.metrics && opts.metrics[`${controllerName}${opts.metrics.suffix.total}`]) {
+          if (opts.metrics && opts.metrics[`${ServiceRouteName}${opts.metrics.suffix.total}`]) {
             opts.metrics[`${controllerName}${opts.metrics.suffix.total}`].mark();
           }
 
-          request.controllerName = controllerName;
+          request.controllerName = ServiceRouteName;
 
           try {
-            if (global.CHECK_TOKEN) await checkAccess(request, item);
+            if (opts.checkToken) await checkAccess(request, item);
           } catch (error) {
             if (error.message.split(' ').includes('expired')) {
               reply.code(440).send({ Status: 440, Description: `${error.message}` });
@@ -149,40 +160,13 @@ async function fastifyOpenapiGlue(instance, opts) {
           }
         };
 
-        item.handler = async (request, reply) => service[controllerName](request, reply);
-
-      }
-      else if (service[lowerClassName][className + methodName]) {
-
-        routesInstance.log.debug('service has', className + methodName);
-
-        item.preValidation = async (request, reply) => {
-
-          if (opts.metrics && opts.metrics[`${className}${methodName}${opts.metrics.suffix.total}`]) {
-            opts.metrics[`${className}${methodName}${opts.metrics.suffix.total}`].mark();
-          }
-
-          request.controllerName = `${className}/${methodName}`;
-
-          try {
-            if (global.CHECK_TOKEN) await checkAccess(request, item);
-          } catch (error) {
-            if (error.message.split(' ').includes('expired')) {
-              reply.code(440).send({ Status: 440, Description: `${error.message}` });
-            } else {
-              reply.code(401).send({ Status: 401, Description: `${error.message}` });
-            }
-          }
-        };
-
-        item.handler = async (request, reply) => service[lowerClassName][className + methodName](request, reply);
-
-      }
-      else {
+      } catch (error) {
+        console.error(`Operation ${item.operationId} not implemented`);
         item.handler = async () => {
           throw new Error(`Operation ${item.operationId} not implemented`);
         };
       }
+
       routesInstance.route(item);
     });
   }
