@@ -140,6 +140,7 @@ async function fastifyOpenapiGlue(instance, opts) {
         const controllerName = item.operationId;
         routesInstance.log.debug("service has", controllerName);
         item.preValidation = async (request, reply, done) => {
+          if(request.body === null) request.body = {};
           if (opts.metrics && opts.metrics[`${controllerName}${opts.metrics.suffix.total}`]) {
             opts.metrics[`${controllerName}${opts.metrics.suffix.total}`].mark();
           }
